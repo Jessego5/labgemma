@@ -32,6 +32,7 @@ import argparse
 import csv
 import hashlib
 import os
+import random
 import signal
 import sys
 import threading
@@ -197,6 +198,38 @@ def fetch_one(row, key_cache, lock) -> dict:
         return out
 
 
+def sample_by_article(rows, limit, seed):
+    """
+    Take a subset of ~`limit` rows, sampled BY ARTICLE.
+
+    Two things this must not do:
+
+      1. Take the head of the manifest. Rows are written in batch-completion
+         order, which tracks the date-sliced enumeration, so `rows[:limit]`
+         is heavily weighted toward the oldest articles -- the exact bias
+         collect_pmcids() was rewritten to avoid.
+
+      2. Sample individual rows at random. That would draw ~1 figure each
+         from `limit` different articles and destroy same-paper hard-negative
+         coverage, which requires >=2 figures from one article.
+
+    So: shuffle the ARTICLES with a fixed seed, then take whole articles until
+    the row budget is spent. Figure groups stay intact and the draw is spread
+    across the entire corpus.
+    """
+    by_article = {}
+    for r in rows:
+        by_article.setdefault(r["pmcid"], []).append(r)
+    pmcids = sorted(by_article)              # sort first so the shuffle is
+    random.Random(seed).shuffle(pmcids)      # reproducible across runs
+    out = []
+    for pmcid in pmcids:
+        if len(out) >= limit:
+            break
+        out.extend(by_article[pmcid])
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -204,7 +237,12 @@ def main(argv=None) -> int:
     ap.add_argument("--manifest", default=str(config.MANIFEST))
     ap.add_argument("--tiers", nargs="*", default=None,
                     help="only download these tiers (default: all)")
-    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--licenses", nargs="*", default=None,
+                    help='only these license classes, e.g. "CC BY" "CC BY-NC" CC0')
+    ap.add_argument("--limit", type=int, default=None,
+                    help="approximate row budget; sampled BY ARTICLE so that "
+                         "same-paper figure groups stay intact")
+    ap.add_argument("--seed", type=int, default=config.SPLIT_SEED)
     args = ap.parse_args(argv)
 
     config.ensure_dirs()
@@ -214,10 +252,16 @@ def main(argv=None) -> int:
 
     with open(args.manifest, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
+    n_all = len(rows)
     if args.tiers:
         rows = [r for r in rows if r.get("tier") in args.tiers]
-    if args.limit:
-        rows = rows[:args.limit]
+    if args.licenses:
+        rows = [r for r in rows if r.get("license_class") in args.licenses]
+    n_eligible = len(rows)
+    if args.limit and len(rows) > args.limit:
+        rows = sample_by_article(rows, args.limit, args.seed)
+    print(f"manifest {n_all:,} rows -> {n_eligible:,} eligible "
+          f"(tiers={args.tiers}, licenses={args.licenses}) -> {len(rows):,} selected")
 
     n_articles = len({r["pmcid"] for r in rows})
     print(f"{len(rows):,} figures across {n_articles:,} articles "
