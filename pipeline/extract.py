@@ -32,6 +32,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import config, scoring
 from .ncbi import NCBIClient, article_s3_prefix, split_articleset
@@ -183,8 +184,16 @@ def cache_path(pmcid: str):
 
 
 def cache_write(pmcid: str, xml: str) -> None:
-    with gzip.open(cache_path(pmcid), "wt", encoding="utf-8") as f:
+    """
+    Write atomically: a kill mid-write would otherwise leave a truncated .gz
+    that cache_read treats as a miss forever. With concurrent workers the
+    window for that is wider, so write to a temp name and rename.
+    """
+    p = cache_path(pmcid)
+    tmp = p.with_suffix(p.suffix + ".part")
+    with gzip.open(tmp, "wt", encoding="utf-8") as f:
         f.write(xml)
+    tmp.replace(p)
 
 
 def cache_read(pmcid: str):
@@ -276,6 +285,9 @@ def main(argv=None) -> int:
     ap.add_argument("--resume", action="store_true",
                     help="append to an existing manifest, skipping cached articles")
     ap.add_argument("--batch", type=int, default=config.EFETCH_BATCH)
+    ap.add_argument("--workers", type=int, default=config.EXTRACT_WORKERS,
+                    help="concurrent efetch batches (default "
+                         f"{config.EXTRACT_WORKERS})")
     args = ap.parse_args(argv)
 
     config.ensure_dirs()
@@ -293,9 +305,34 @@ def main(argv=None) -> int:
     todo = [p for p in pmcids if p not in done]
     print(f"\n{len(pmcids):,} ids enumerated, {len(todo):,} still to fetch.\n")
 
+    batches = [todo[i:i + args.batch] for i in range(0, len(todo), args.batch)]
+
+    def fetch_and_parse(batch):
+        """
+        One batch: serve from cache, fetch the misses, parse to manifest rows.
+
+        Runs in a worker thread. Does NOT touch the CSV -- rows are returned
+        and written by the main thread, so the writer stays single-threaded
+        and the manifest can never interleave a half-written row.
+        """
+        cached = {p: cache_read(p) for p in batch}
+        missing = [p for p, x in cached.items() if x is None]
+        if missing:
+            xml = client.fetch_batch(missing)
+            for pmcid, art_xml in split_articleset(xml):
+                cache_write(pmcid, art_xml)
+                cached[pmcid] = art_xml
+        rows, n_art = [], 0
+        for pmcid, art_xml in cached.items():
+            if not art_xml:
+                continue
+            rows += parse_article(pmcid, art_xml)
+            n_art += 1
+        return rows, n_art, len(batch)
+
     mode = "a" if (args.resume and config.MANIFEST.exists()) else "w"
     t0 = time.time()
-    n_rows = n_articles = 0
+    n_rows = n_articles = n_done = n_failed = 0
 
     with open(config.MANIFEST, mode, newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=FIELDS, extrasaction="ignore")
@@ -303,35 +340,29 @@ def main(argv=None) -> int:
             w.writeheader()
             fh.flush()
 
-        for i in range(0, len(todo), args.batch):
-            batch = todo[i:i + args.batch]
-
-            # Serve from cache where possible; fetch only the misses.
-            cached = {p: cache_read(p) for p in batch}
-            missing = [p for p, x in cached.items() if x is None]
-            if missing:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(fetch_and_parse, b): b for b in batches}
+            for k, fut in enumerate(as_completed(futs), 1):
                 try:
-                    xml = client.fetch_batch(missing)
-                    for pmcid, art_xml in split_articleset(xml):
-                        cache_write(pmcid, art_xml)
-                        cached[pmcid] = art_xml
+                    rows, n_art, n_in = fut.result()
                 except Exception as e:
-                    print(f"  batch {i//args.batch + 1}: FETCH ERROR {e}")
-
-            for pmcid, art_xml in cached.items():
-                if not art_xml:
+                    n_failed += len(futs[fut])
+                    print(f"  batch FETCH ERROR {type(e).__name__}: {e}")
                     continue
-                rows = parse_article(pmcid, art_xml)
                 w.writerows(rows)
+                fh.flush()          # survive a kill
                 n_rows += len(rows)
-                n_articles += 1
-            fh.flush()      # survive a kill
+                n_articles += n_art
+                n_done += n_in
+                if k % 10 == 0 or n_done >= len(todo):
+                    rate = n_done / max(time.time() - t0, 1e-6)
+                    eta = (len(todo) - n_done) / max(rate, 1e-6)
+                    print(f"  [{n_done:,}/{len(todo):,}] {n_rows:,} figures kept "
+                          f"| {rate:.1f} art/s | ETA {eta/60:.1f} min")
 
-            done_n = min(i + args.batch, len(todo))
-            rate = done_n / max(time.time() - t0, 1e-6)
-            eta = (len(todo) - done_n) / max(rate, 1e-6)
-            print(f"  [{done_n:,}/{len(todo):,}] {n_rows:,} figures kept "
-                  f"| {rate:.1f} art/s | ETA {eta/60:.1f} min")
+    if n_failed:
+        print(f"\n!! {n_failed:,} articles failed to fetch. Re-run with "
+              f"--resume to retry them (cached articles are skipped).")
 
     dt = time.time() - t0
     print(f"\nDONE in {dt/60:.1f} min")

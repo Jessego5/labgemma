@@ -21,6 +21,7 @@ Three things this handles that the original scripts did not:
      the cap, making the pool effectively unbounded.
 """
 
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
@@ -31,29 +32,64 @@ from . import config
 
 
 class RateLimiter:
-    """Spaces requests to at most `rate` per second."""
+    """
+    Spaces requests to at most `rate` per second, across all threads.
+
+    The lock is held while sleeping, which is deliberate: it serializes the
+    *scheduling* of requests so the global rate is honoured no matter how many
+    workers are running. The requests themselves happen outside the lock, so
+    throughput is unaffected -- at 10 req/s a thread holds it for at most
+    0.1s, against multi-second HTTP calls.
+    """
 
     def __init__(self, rate: float):
         self.min_interval = 1.0 / rate
         self._last = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
-        gap = time.monotonic() - self._last
-        if gap < self.min_interval:
-            time.sleep(self.min_interval - gap)
-        self._last = time.monotonic()
+        with self._lock:
+            gap = time.monotonic() - self._last
+            if gap < self.min_interval:
+                time.sleep(self.min_interval - gap)
+            self._last = time.monotonic()
 
 
 class NCBIClient:
-    """Thin, polite wrapper over the E-utilities endpoints we need."""
+    """
+    Thin, polite wrapper over the E-utilities endpoints we need.
+
+    Thread-safe: the rate limiter is shared and locked, each thread gets its
+    own pooled Session, and the request counters are guarded. One client can
+    be used from many workers concurrently.
+    """
 
     def __init__(self, email=None, api_key=None, rate=None):
         self.email = email or config.EMAIL
         self.api_key = api_key if api_key is not None else config.API_KEY
         self.limiter = RateLimiter(rate or config.RATE_LIMIT)
-        self.session = requests.Session()
+        self._local = threading.local()
+        self._counter_lock = threading.Lock()
         self.n_requests = 0
         self.n_retries = 0
+
+    @property
+    def session(self) -> requests.Session:
+        """One pooled Session per thread; `requests.Session` is not
+        guaranteed thread-safe for concurrent use."""
+        s = getattr(self._local, "s", None)
+        if s is None:
+            s = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=4, pool_maxsize=4)
+            s.mount("https://", adapter)
+            self._local.s = s
+        return s
+
+    def _bump(self, requests_=0, retries=0) -> None:
+        with self._counter_lock:
+            self.n_requests += requests_
+            self.n_retries += retries
 
     def _params(self, extra: dict) -> dict:
         p = {"email": self.email, **extra}
@@ -70,14 +106,14 @@ class NCBIClient:
             self.limiter.wait()
             try:
                 r = self.session.get(url, params=self._params(params), timeout=timeout)
-                self.n_requests += 1
+                self._bump(requests_=1)
                 if r.status_code in (429, 500, 502, 503, 504):
                     raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
                 r.raise_for_status()
                 return r
             except (requests.RequestException, requests.HTTPError) as e:
                 last_err = e
-                self.n_retries += 1
+                self._bump(retries=1)
                 if attempt == config.MAX_RETRIES - 1:
                     break
                 time.sleep(delay)

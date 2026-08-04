@@ -68,6 +68,13 @@ BACKOFF_BASE = 1.5                       # seconds; doubles each retry
 # in the whole pipeline. Keep it well under NCBI's ~200-id practical ceiling.
 EFETCH_BATCH = 50
 
+# Concurrent efetch batches. With a batch of 50, one request covers 50
+# articles, so 8 workers issue only ~2.5 req/s against the 10 req/s budget --
+# roughly a quarter of the allowance. The bottleneck is round-trip latency,
+# not the rate limit, which is why fanning out helps so much here.
+# The shared RateLimiter still enforces the global ceiling across all threads.
+EXTRACT_WORKERS = 8
+
 # S3 is not rate limited by NCBI and is pure network latency, so we fan out.
 S3_WORKERS = 16
 
