@@ -85,7 +85,12 @@ the path works.
 
 ### Day 2 — Benchmark construction
 
-Build `matching.csv` (binary) and `gallery.csv` (retrieval) from `pairs.csv`.
+```bash
+python -m pipeline.task
+```
+
+Builds `task/a1/`, `task/a2/` (each with `train.csv` + `validation.csv`),
+a shared frozen `task/test.csv`, and `task/gallery.csv` for Recall@K.
 
 Task format is **VQA-as-matching**: *"Does this caption describe this figure?
 Answer yes or no."* Chosen because it runs on the existing harness unmodified;
