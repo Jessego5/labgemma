@@ -1,0 +1,49 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Datasets and pipeline outputs.
+# Everything large lives on the RunPod volume under $LABGEMMA_DATA and is
+# fully reproducible from the pipeline -- never commit it.
+data/
+xml_cache/
+manifest.csv
+pairs.csv
+download_log.csv
+stats.json
+pmc_gel_manifest.csv
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.tif
+*.tiff
+*.zip
+
+# Model weights and checkpoints
+checkpoints_text/
+checkpoints/
+outputs/
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+
+# Third-party training harness -- clone separately, do not vendor.
+#   git clone https://github.com/mattmireles/gemma-tuner-multimodal
+gemma-tuner-multimodal/
+
+# Secrets
+.env
+env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
