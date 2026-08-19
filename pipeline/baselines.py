@@ -91,6 +91,52 @@ def binary_metrics(scored, thr):
             "f1": f1, "tp": tp, "fp": fp, "tn": tn, "fn": fn, "n": n}
 
 
+def youden_threshold(scored):
+    """
+    Threshold maximising Youden's J (TPR - FPR).
+
+    Preferred over F1 maximisation for this baseline. F1 ignores true
+    negatives, so when a large block of scores ties at 0 -- as happens
+    whenever OCR finds no symbols -- it is maximised by predicting everything
+    positive, which is not an operating point, it is a degenerate classifier.
+    J accounts for both error directions and cannot be gamed that way.
+    """
+    cands = sorted({s for s, _ in scored})
+    if not cands:
+        return 0.0
+    best, best_j = cands[0], -2.0
+    for t in cands:
+        m = binary_metrics(scored, t)
+        tpr = m["tp"] / max(m["tp"] + m["fn"], 1)
+        fpr = m["fp"] / max(m["fp"] + m["tn"], 1)
+        if tpr - fpr > best_j:
+            best, best_j = t, tpr - fpr
+    return best
+
+
+def coverage_report(rows, cache, img_syms, scorer):
+    """
+    How much of the test set can this baseline even speak to?
+
+    A symbol-overlap score of 0 means one of two very different things: the
+    caption genuinely shares nothing with the image, or OCR simply found no
+    symbols in the image. Those must not be conflated -- lumping them together
+    drags AUROC toward 0.5 through a huge tie block and understates how strong
+    the signal is where it exists.
+    """
+    import os
+    covered, uncovered = [], []
+    for r in rows:
+        name = os.path.basename(r["image_path"])
+        a = img_syms.get(name)
+        if a is None:
+            a = symbols(cache.get(name, {}).get("text", ""))
+            img_syms[name] = a
+        (covered if a else uncovered).append(
+            (scorer(r, cache, img_syms), int(r["label"])))
+    return covered, uncovered
+
+
 def best_threshold(scored):
     """
     Threshold maximising F1 on the given (validation) set.
@@ -218,8 +264,13 @@ def main(argv=None) -> int:
 
     img_syms = {}
     vscored = [(ocr_score(r, cache, img_syms), int(r["label"])) for r in val]
-    thr, degenerate = best_threshold(vscored)
-    print(f"\nOCR threshold tuned on validation: {thr:.4f}")
+    thr = youden_threshold(vscored)
+    _, degenerate = best_threshold(vscored)
+    print(f"\nOCR threshold tuned on validation (Youden J): {thr:.4f}")
+    if degenerate:
+        n_zero = sum(1 for s, _ in vscored if s == 0.0)
+        print(f"  (F1-max would have degenerated here: "
+              f"{n_zero:,}/{len(vscored):,} validation scores are exactly 0)")
     if degenerate:
         n_zero = sum(1 for s, _ in vscored if s == 0.0)
         print(f"  !! DEGENERATE: this threshold predicts a single class "
@@ -237,6 +288,29 @@ def main(argv=None) -> int:
             scored["easy"].append((s, y))
             scored["hard"].append((s, y))
     ocr_entry = report("ocr_symbol_overlap", scored, thr, results)
+
+    # How much of the test set does OCR actually reach?
+    cov, uncov = coverage_report(test, cache, img_syms, ocr_score)
+    n_img = len({__import__("os").path.basename(r["image_path"]) for r in test})
+    n_img_sym = sum(1 for n in {__import__("os").path.basename(r["image_path"])
+                                for r in test} if img_syms.get(n))
+    print(f"\nOCR coverage")
+    print(f"  images yielding >=1 symbol   {n_img_sym:,}/{n_img:,} "
+          f"({n_img_sym/max(n_img,1):.0%})")
+    print(f"  test rows OCR can speak to   {len(cov):,}/{len(test):,} "
+          f"({len(cov)/max(len(test),1):.0%})")
+    if cov:
+        print(f"  AUROC on covered rows only   {auroc(cov):.3f}"
+              f"   (vs {auroc(scored['all']):.3f} overall)")
+    if uncov:
+        print(f"  AUROC on uncovered rows      {auroc(uncov):.3f}"
+              f"   (expect ~0.50 -- all scores tie at 0)")
+    results["ocr_coverage"] = {
+        "images_with_symbols": n_img_sym, "images_total": n_img,
+        "rows_covered": len(cov), "rows_total": len(test),
+        "auroc_covered": auroc(cov) if cov else None,
+        "auroc_uncovered": auroc(uncov) if uncov else None,
+    }
 
     # -- gallery Recall@K --------------------------------------------------
     gal_path = task / "gallery.csv"
