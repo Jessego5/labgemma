@@ -65,10 +65,11 @@ def remap_masked(rows):
 class MatchingDataset:
     """(image, question, yes/no) -> input_ids with loss only on the answer."""
 
-    def __init__(self, rows, processor, max_len=768):
+    def __init__(self, rows, processor, max_len=1024):
         self.rows = rows
         self.proc = processor
         self.max_len = max_len
+        self.bad = 0        # rows whose answer was lost to truncation
 
     def __len__(self):
         return len(self.rows)
@@ -90,17 +91,27 @@ class MatchingDataset:
                         truncation=True, max_length=self.max_len)
         enc = {k: v[0] for k, v in enc.items()}
 
-        # Mask everything before the answer.
-        p_len = len(self.proc(text=prompt, images=img,
-                              return_tensors="pt",
-                              truncation=True,
-                              max_length=self.max_len)["input_ids"][0])
-        labels = enc["input_ids"].clone()
-        labels[:p_len] = -100
-        pad_id = self.proc.tokenizer.pad_token_id
-        if pad_id is not None:
-            labels[labels == pad_id] = -100
+        # Supervise only the trailing answer tokens.
+        #
+        # The previous approach tokenised the prompt separately and masked
+        # that many positions. That desyncs: the tokeniser merges across the
+        # prompt/answer boundary, so the prompt-only length does not
+        # necessarily equal the answer's start index in the joint encoding.
+        # Being off by one supervises a template token instead of "yes"/"no",
+        # which is how a two-way choice produced a loss of 19.6 (p ~ 3e-9).
+        #
+        # Counting back from the END cannot desync, because the answer is the
+        # last thing in the string.
+        ids = enc["input_ids"]
+        ans_ids = self.proc.tokenizer.encode(r["answer"], add_special_tokens=False)
+        n_ans = max(1, len(ans_ids))
+        labels = ids.clone()
+        labels[:-n_ans] = -100
         enc["labels"] = labels
+
+        # If truncation ate the answer, the row teaches the wrong token.
+        if list(ids[-n_ans:]) != list(ans_ids):
+            self.bad += 1
         return enc
 
 
@@ -208,6 +219,15 @@ def cmd_fit(args) -> int:
         model.enable_input_require_grads()
     ds = MatchingDataset(rows, proc, args.max_len)
     pad_id = proc.tokenizer.pad_token_id or 0
+
+    # One-time check that supervision lands where we think it does. A silent
+    # off-by-one here is invisible in the loss curve until the model is useless.
+    probe = ds[0]
+    sup = [t for t in probe["labels"].tolist() if t != -100]
+    print(f"  label check  : {len(sup)} supervised token(s) = "
+          f"{proc.tokenizer.decode(sup)!r} (expect 'yes' or 'no')")
+    print(f"  seq length   : {len(probe['input_ids'])} tokens "
+          f"(max {args.max_len})")
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True,
                     collate_fn=lambda b: collate(b, pad_id), num_workers=2)
 
@@ -250,6 +270,9 @@ def cmd_fit(args) -> int:
             step += 1
         print(f"epoch {ep+1} mean loss {run/max(len(dl),1):.4f} "
               f"({step} optimizer steps so far)")
+        if ds.bad:
+            print(f"  !! {ds.bad} row(s) lost their answer to truncation -- "
+                  f"raise --max-len")
 
     out = args.out or str(config.DATA_ROOT / "runs" / args.arm)
     os.makedirs(out, exist_ok=True)
@@ -316,7 +339,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument("--max-len", type=int, default=768)
+    ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--attn", default="sdpa",
                     choices=["sdpa", "eager", "flash_attention_2"])
