@@ -288,9 +288,20 @@ def main(argv=None) -> int:
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--max-len", type=int, default=768)
     ap.add_argument("--limit", type=int, default=None)
+
+    # The same options are accepted AFTER the subcommand too, which is where
+    # anyone would naturally type them. argparse.SUPPRESS is what makes that
+    # safe: without it the subparser's default would overwrite a value given
+    # before the subcommand, silently ignoring it.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--model", default=argparse.SUPPRESS)
+    common.add_argument("--max-len", dest="max_len", type=int,
+                        default=argparse.SUPPRESS)
+    common.add_argument("--limit", type=int, default=argparse.SUPPRESS)
+
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    f = sub.add_parser("fit")
+    f = sub.add_parser("fit", parents=[common])
     f.add_argument("--arm", required=True, choices=["a1", "a2"])
     f.add_argument("--epochs", type=int, default=2)
     f.add_argument("--batch", type=int, default=2)
@@ -299,7 +310,7 @@ def main(argv=None) -> int:
     f.add_argument("--out", default=None)
     f.set_defaults(func=cmd_fit)
 
-    s = sub.add_parser("score")
+    s = sub.add_parser("score", parents=[common])
     s.add_argument("--adapter", default=None, help="omit for zero-shot base")
     s.add_argument("--eval", default=None)
     s.add_argument("--masked", action="store_true")
