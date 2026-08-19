@@ -43,8 +43,17 @@ STOPWORDS = {
 }
 SYMBOL_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,7}(?:-[A-Z0-9]{1,4})?)\b")
 
-# tesseract confidence below this is usually noise from band edges.
-MIN_CONF = 40
+# Symbols are only TRUSTED above this confidence -- weak detections on blot
+# images are usually band edges rather than text.
+EXTRACT_MIN_CONF = 40
+
+# But we MASK everything tesseract flags at all, however weakly. Masking only
+# the confident boxes is not enough: measured on the real test set, masked
+# images still scored AUROC 0.620 (chance is 0.50) because text that read
+# weakly the first time became legible once its confident neighbours were
+# painted out, and re-OCR'd above threshold. Masking has to be strictly more
+# aggressive than extraction, not equally aggressive.
+MASK_MIN_CONF = -1
 
 
 def symbols(text: str) -> set:
@@ -70,9 +79,9 @@ def ocr_image(path):
     """
     Return {"text": str, "boxes": [[x, y, w, h], ...]} for one image.
 
-    Boxes are only kept for tokens above MIN_CONF, since low-confidence
-    detections on blot images are usually band edges rather than text, and
-    masking those would destroy image content rather than text.
+    Every detected box is stored WITH its confidence, so masking and symbol
+    extraction can apply different thresholds to the same cached result:
+    masking uses all of them, extraction only the confident ones.
     """
     pytesseract, Image = _tesseract()
     try:
@@ -93,11 +102,11 @@ def ocr_image(path):
             conf = float(d["conf"][i])
         except (ValueError, KeyError, IndexError):
             conf = -1.0
-        if conf < MIN_CONF:
-            continue
-        words.append(w)
-        boxes.append([int(d["left"][i]), int(d["top"][i]),
-                      int(d["width"][i]), int(d["height"][i])])
+        if conf >= EXTRACT_MIN_CONF:
+            words.append(w)
+        if conf >= MASK_MIN_CONF:
+            boxes.append([int(d["left"][i]), int(d["top"][i]),
+                          int(d["width"][i]), int(d["height"][i]), conf])
     return {"text": " ".join(words), "boxes": boxes}
 
 
@@ -236,8 +245,12 @@ def cmd_mask(args) -> int:
         arr = np.asarray(img)
         fill = tuple(int(v) for v in np.median(arr.reshape(-1, 3), axis=0))
         draw = ImageDraw.Draw(img)
-        for (x, y, w, h) in rec.get("boxes", []):
-            pad = 2
+        for box in rec.get("boxes", []):
+            x, y, w, h = box[:4]
+            # Pad proportionally to glyph height: a fixed 2px pad leaves
+            # ascenders and antialiased edges behind on large labels, and
+            # partial glyphs are still readable.
+            pad = max(3, int(0.25 * h))
             draw.rectangle([x - pad, y - pad, x + w + pad, y + h + pad], fill=fill)
             n_boxes += 1
         img.save(dest)

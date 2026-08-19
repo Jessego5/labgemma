@@ -92,16 +92,27 @@ def binary_metrics(scored, thr):
 
 
 def best_threshold(scored):
-    """Threshold maximising F1 on the given (validation) set."""
+    """
+    Threshold maximising F1 on the given (validation) set.
+
+    Returns (threshold, degenerate). F1 maximisation degenerates when most
+    scores tie -- as they do once the text is masked out and nearly every
+    overlap is 0.0 -- and picks a threshold that predicts a single class.
+    That yields recall 1.0 and accuracy at the base rate, which can sit BELOW
+    the random baseline and is not a meaningful operating point. Callers
+    should report AUROC and ignore the thresholded metrics when degenerate.
+    """
     cands = sorted({s for s, _ in scored})
     if not cands:
-        return 0.0
+        return 0.0, True
     best, best_f1 = cands[0], -1.0
     for t in cands:
         f1 = binary_metrics(scored, t)["f1"]
         if f1 > best_f1:
             best, best_f1 = t, f1
-    return best
+    m = binary_metrics(scored, best)
+    degenerate = (m["tp"] + m["fp"] == m["n"]) or (m["tp"] + m["fp"] == 0)
+    return best, degenerate
 
 
 # --------------------------------------------------------------------------
@@ -207,8 +218,14 @@ def main(argv=None) -> int:
 
     img_syms = {}
     vscored = [(ocr_score(r, cache, img_syms), int(r["label"])) for r in val]
-    thr = best_threshold(vscored)
+    thr, degenerate = best_threshold(vscored)
     print(f"\nOCR threshold tuned on validation: {thr:.4f}")
+    if degenerate:
+        n_zero = sum(1 for s, _ in vscored if s == 0.0)
+        print(f"  !! DEGENERATE: this threshold predicts a single class "
+              f"({n_zero:,}/{len(vscored):,} validation scores are exactly 0).")
+        print(f"     Read AUROC only -- accuracy/P/R/F1 below are not a "
+              f"meaningful operating point.")
 
     scored = defaultdict(list)
     for r in test:
