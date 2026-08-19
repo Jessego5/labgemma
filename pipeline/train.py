@@ -131,14 +131,24 @@ def collate(batch, pad_id):
 # --------------------------------------------------------------------------
 
 
-def load_model(model_id, adapter=None, train=False):
+def load_model(model_id, adapter=None, train=False, attn="sdpa"):
+    """
+    Load Gemma 3 with LoRA on the language model, vision tower frozen.
+
+    attn defaults to "sdpa", NOT "eager". Eager attention makes SigLIP
+    materialise the full patch-by-patch attention matrix: at 896x896 the
+    vision tower sees 4096 patches, so one head is a 4096x4096 fp32 matrix
+    (67 MB), and 16 heads at batch 2 is ~2 GB of transient activation -- which
+    OOMs a 24 GB card before the language model even runs. SDPA computes the
+    same thing without ever materialising it.
+    """
     import torch
     from transformers import AutoProcessor, AutoModelForImageTextToText
 
     proc = AutoProcessor.from_pretrained(model_id)
     model = AutoModelForImageTextToText.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16,
-        device_map="auto", attn_implementation="eager")
+        model_id, dtype=torch.bfloat16,
+        device_map="auto", attn_implementation=attn)
 
     if adapter:
         from peft import PeftModel
@@ -156,6 +166,7 @@ def load_model(model_id, adapter=None, train=False):
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
         model = get_peft_model(model, cfg)
         model.print_trainable_parameters()
+        model.config.use_cache = False   # incompatible with grad checkpointing
     return proc, model
 
 
@@ -191,7 +202,10 @@ def cmd_fit(args) -> int:
           f"{sum(1 for r in rows if r['neg_type']=='hard'):,} hard / "
           f"{sum(1 for r in rows if r['neg_type']=='easy'):,} easy")
 
-    proc, model = load_model(args.model, train=True)
+    proc, model = load_model(args.model, train=True, attn=args.attn)
+    if args.grad_ckpt:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
     ds = MatchingDataset(rows, proc, args.max_len)
     pad_id = proc.tokenizer.pad_token_id or 0
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True,
@@ -244,7 +258,7 @@ def cmd_score(args) -> int:
         print("(scoring against text-MASKED images)")
     print(f"{len(rows):,} eval rows")
 
-    proc, model = load_model(args.model, adapter=args.adapter)
+    proc, model = load_model(args.model, adapter=args.adapter, attn=args.attn)
     model.eval()
     ids = yes_no_ids(proc)
     print(f"yes ids {ids['yes']}  no ids {ids['no']}")
@@ -288,6 +302,8 @@ def main(argv=None) -> int:
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--max-len", type=int, default=768)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--attn", default="sdpa",
+                    choices=["sdpa", "eager", "flash_attention_2"])
 
     # The same options are accepted AFTER the subcommand too, which is where
     # anyone would naturally type them. argparse.SUPPRESS is what makes that
@@ -298,14 +314,20 @@ def main(argv=None) -> int:
     common.add_argument("--max-len", dest="max_len", type=int,
                         default=argparse.SUPPRESS)
     common.add_argument("--limit", type=int, default=argparse.SUPPRESS)
+    common.add_argument("--attn", default=argparse.SUPPRESS)
 
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     f = sub.add_parser("fit", parents=[common])
     f.add_argument("--arm", required=True, choices=["a1", "a2"])
     f.add_argument("--epochs", type=int, default=2)
-    f.add_argument("--batch", type=int, default=2)
-    f.add_argument("--accum", type=int, default=8)
+    # batch 1 x accum 16 keeps the effective batch at 16 while holding only
+    # one image's vision activations at a time -- the binding constraint on
+    # a 24 GB card is the vision tower, not the language model.
+    f.add_argument("--batch", type=int, default=1)
+    f.add_argument("--accum", type=int, default=16)
+    f.add_argument("--grad-ckpt", action="store_true",
+                   help="trade ~30%% speed for a large activation-memory cut")
     f.add_argument("--lr", type=float, default=1e-4)
     f.add_argument("--out", default=None)
     f.set_defaults(func=cmd_fit)
