@@ -86,7 +86,7 @@ class MatchingDataset:
         # the prompt/answer boundary and lets the chat template and the image
         # expansion interact in ways that are hard to see; appending ids makes
         # the answer's position exact by construction.
-        ans_ids = self.proc.tokenizer.encode(r["answer"],
+        ans_ids = self.proc.tokenizer.encode(answer_text(r["answer"]),
                                              add_special_tokens=False)
         n_ans = max(1, len(ans_ids))
         ans = torch.tensor(ans_ids, dtype=enc["input_ids"].dtype)
@@ -106,6 +106,23 @@ class MatchingDataset:
         labels[:-n_ans] = -100
         out["labels"] = labels
         return out
+
+
+def answer_text(answer):
+    """
+    Map the dataset's "yes"/"no" to the casing the model actually emits.
+
+    Probing the untrained model shows it puts ~1.0 on "Yes"/"No" and ~3e-9 on
+    the lowercase forms. Supervising lowercase therefore asked it to produce a
+    token it considers essentially impossible, which is precisely the 19.58
+    loss we saw: -log(3e-9) = 19.6, well above the 12.5 that uniform-random
+    over a 262k vocab would give.
+
+    Training should nudge a model that already answers in the right shape, not
+    fight its output convention. Scoring already sums over both casings, so
+    the reported probabilities are unaffected by this choice.
+    """
+    return {"yes": "Yes", "no": "No"}.get(answer.strip().lower(), answer)
 
 
 def encode_prompt(proc, image_path, question, max_len):
@@ -247,7 +264,7 @@ def cmd_fit(args) -> int:
     probe = ds[0]
     sup = [t for t in probe["labels"].tolist() if t != -100]
     print(f"  label check  : {len(sup)} supervised token(s) = "
-          f"{proc.tokenizer.decode(sup)!r} (expect 'yes' or 'no')")
+          f"{proc.tokenizer.decode(sup)!r} (expect 'Yes' or 'No')")
     print(f"  seq length   : {len(probe['input_ids'])} tokens "
           f"(max {args.max_len})")
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True,
