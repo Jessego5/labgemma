@@ -76,43 +76,65 @@ class MatchingDataset:
 
     def __getitem__(self, i):
         import torch
-        from PIL import Image
 
         r = self.rows[i]
-        img = Image.open(r["image_path"]).convert("RGB")
-        msgs = [{"role": "user", "content": [
-            {"type": "image"}, {"type": "text", "text": r["question"]}]}]
+        enc = encode_prompt(self.proc, r["image_path"], r["question"],
+                            self.max_len)
 
-        prompt = self.proc.apply_chat_template(
-            msgs, add_generation_prompt=True, tokenize=False)
-        full = prompt + r["answer"]
-
-        enc = self.proc(text=full, images=img, return_tensors="pt",
-                        truncation=True, max_length=self.max_len)
-        enc = {k: v[0] for k, v in enc.items()}
-
-        # Supervise only the trailing answer tokens.
-        #
-        # The previous approach tokenised the prompt separately and masked
-        # that many positions. That desyncs: the tokeniser merges across the
-        # prompt/answer boundary, so the prompt-only length does not
-        # necessarily equal the answer's start index in the joint encoding.
-        # Being off by one supervises a template token instead of "yes"/"no",
-        # which is how a two-way choice produced a loss of 19.6 (p ~ 3e-9).
-        #
-        # Counting back from the END cannot desync, because the answer is the
-        # last thing in the string.
-        ids = enc["input_ids"]
-        ans_ids = self.proc.tokenizer.encode(r["answer"], add_special_tokens=False)
+        # Append the answer as TOKEN IDS rather than concatenating strings and
+        # re-tokenising. String concatenation lets the tokeniser merge across
+        # the prompt/answer boundary and lets the chat template and the image
+        # expansion interact in ways that are hard to see; appending ids makes
+        # the answer's position exact by construction.
+        ans_ids = self.proc.tokenizer.encode(r["answer"],
+                                             add_special_tokens=False)
         n_ans = max(1, len(ans_ids))
-        labels = ids.clone()
-        labels[:-n_ans] = -100
-        enc["labels"] = labels
+        ans = torch.tensor(ans_ids, dtype=enc["input_ids"].dtype)
 
-        # If truncation ate the answer, the row teaches the wrong token.
-        if list(ids[-n_ans:]) != list(ans_ids):
-            self.bad += 1
-        return enc
+        out = {"input_ids": torch.cat([enc["input_ids"], ans])}
+        out["attention_mask"] = torch.cat(
+            [enc["attention_mask"], torch.ones(n_ans, dtype=enc["attention_mask"].dtype)])
+        if "token_type_ids" in enc:
+            out["token_type_ids"] = torch.cat(
+                [enc["token_type_ids"],
+                 torch.zeros(n_ans, dtype=enc["token_type_ids"].dtype)])
+        for k, v in enc.items():
+            if k not in out:
+                out[k] = v
+
+        labels = out["input_ids"].clone()
+        labels[:-n_ans] = -100
+        out["labels"] = labels
+        return out
+
+
+def encode_prompt(proc, image_path, question, max_len):
+    """
+    Build model inputs for one (image, question) via the processor's own chat
+    template with tokenize=True.
+
+    This is the documented path for Gemma 3 and it keeps image-token expansion
+    inside the processor. Rendering the template to a string and then calling
+    the processor on that string works by accident at best -- the placeholder
+    handling differs between the two routes.
+    """
+    from PIL import Image
+
+    img = Image.open(image_path).convert("RGB")
+    msgs = [{"role": "user", "content": [
+        {"type": "image", "image": img},
+        {"type": "text", "text": question}]}]
+    enc = proc.apply_chat_template(
+        msgs, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt")
+    out = {k: (v[0] if hasattr(v, "shape") and v.shape and v.shape[0] == 1 else v)
+           for k, v in enc.items()}
+    if len(out["input_ids"]) > max_len:
+        keep = max_len
+        for k in ("input_ids", "attention_mask", "token_type_ids"):
+            if k in out:
+                out[k] = out[k][:keep]
+    return out
 
 
 def collate(batch, pad_id):
@@ -302,18 +324,16 @@ def cmd_score(args) -> int:
     ids = yes_no_ids(proc)
     print(f"yes ids {ids['yes']}  no ids {ids['no']}")
 
-    from PIL import Image
     preds = []
     with torch.no_grad():
         for i, r in enumerate(rows, 1):
-            img = Image.open(r["image_path"]).convert("RGB")
-            msgs = [{"role": "user", "content": [
-                {"type": "image"}, {"type": "text", "text": r["question"]}]}]
-            prompt = proc.apply_chat_template(
-                msgs, add_generation_prompt=True, tokenize=False)
-            enc = proc(text=prompt, images=img, return_tensors="pt",
-                       truncation=True, max_length=args.max_len)
-            enc = {k: v.to(model.device) for k, v in enc.items()}
+            # Same construction as training, so scoring cannot drift from fit.
+            enc = encode_prompt(proc, r["image_path"], r["question"],
+                                args.max_len)
+            enc = {k: (v.unsqueeze(0) if hasattr(v, "dim") and v.dim() >= 1
+                       else v) for k, v in enc.items()}
+            enc = {k: (v.to(model.device) if hasattr(v, "to") else v)
+                   for k, v in enc.items()}
             logits = model(**enc).logits[0, -1]          # next-token logits
             probs = torch.softmax(logits.float(), dim=-1)
             py = float(probs[ids["yes"]].sum())
@@ -332,6 +352,46 @@ def cmd_score(args) -> int:
         json.dump(preds, f)
     print(f"\nwrote {out}")
     print(f"score it with: python -m pipeline.report {out}")
+    return 0
+
+
+def cmd_probe(args) -> int:
+    """
+    Show what the model actually predicts at the answer position.
+
+    A loss far ABOVE uniform-random (log(vocab) ~= 12.5 for Gemma 3) means the
+    model is confidently predicting something else, which is a symptom of
+    malformed input rather than misplaced labels. This prints the top
+    candidates so that distinction takes seconds instead of guesswork.
+    """
+    import torch
+
+    rows = load_rows(str(config.DATA_ROOT / "task" / "test.csv"), args.limit or 3)
+    proc, model = load_model(args.model, adapter=args.adapter, attn=args.attn)
+    model.eval()
+    ids = yes_no_ids(proc)
+
+    with torch.no_grad():
+        for r in rows:
+            enc = encode_prompt(proc, r["image_path"], r["question"], args.max_len)
+            enc = {k: (v.unsqueeze(0) if hasattr(v, "dim") and v.dim() >= 1 else v)
+                   for k, v in enc.items()}
+            enc = {k: (v.to(model.device) if hasattr(v, "to") else v)
+                   for k, v in enc.items()}
+            logits = model(**enc).logits[0, -1].float()
+            probs = torch.softmax(logits, dim=-1)
+            top = torch.topk(probs, 8)
+            py = float(probs[ids["yes"]].sum())
+            pn = float(probs[ids["no"]].sum())
+            print(f"\n  gold={r['answer']}  seq_len={len(enc['input_ids'][0])}")
+            print(f"  P(yes)={py:.4g}  P(no)={pn:.4g}  "
+                  f"ratio={py/max(py+pn,1e-9):.3f}")
+            print("  top tokens: " + ", ".join(
+                f"{proc.tokenizer.decode([int(i)])!r}:{float(p):.3f}"
+                for p, i in zip(top.values, top.indices)))
+    print("\nIf the top tokens look like plausible continuations, input "
+          "construction is fine.\nIf they are punctuation or template "
+          "fragments, the prompt is malformed.")
     return 0
 
 
@@ -377,6 +437,10 @@ def main(argv=None) -> int:
     s.add_argument("--masked", action="store_true")
     s.add_argument("--out", default=None)
     s.set_defaults(func=cmd_score)
+
+    pr = sub.add_parser("probe", parents=[common])
+    pr.add_argument("--adapter", default=None)
+    pr.set_defaults(func=cmd_probe)
 
     args = ap.parse_args(argv)
     config.ensure_dirs()
