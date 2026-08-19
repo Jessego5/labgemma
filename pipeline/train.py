@@ -243,14 +243,28 @@ def cmd_fit(args) -> int:
     from transformers import get_linear_schedule_with_warmup
 
     task = config.DATA_ROOT / "task" / args.arm
-    rows = load_rows(task / "train.csv", args.limit)
-    print(f"arm {args.arm}: {len(rows):,} train rows")
-    print(f"  label balance: "
-          f"{sum(1 for r in rows if r['answer']=='yes'):,} yes / "
-          f"{sum(1 for r in rows if r['answer']=='no'):,} no")
-    print(f"  negatives    : "
-          f"{sum(1 for r in rows if r['neg_type']=='hard'):,} hard / "
-          f"{sum(1 for r in rows if r['neg_type']=='easy'):,} easy")
+    allrows = load_rows(task / "train.csv")
+    rows = allrows[:args.limit] if args.limit else allrows
+
+    # Report the composition of the WHOLE arm, not just the rows --limit kept.
+    # The point of a1-vs-a2 is that only the negative type differs, so if a2
+    # has no hard negatives the two arms are the same experiment and the
+    # comparison measures nothing. A smoke test's first few rows say nothing
+    # about that, and it is far too expensive a mistake to discover after
+    # a full run.
+    hard = sum(1 for r in allrows if r["neg_type"] == "hard")
+    easy = sum(1 for r in allrows if r["neg_type"] == "easy")
+    negs = max(hard + easy, 1)
+    print(f"arm {args.arm}: training on {len(rows):,} of {len(allrows):,} rows")
+    print(f"  full arm     : {sum(1 for r in allrows if r['label']=='1'):,} pos"
+          f" / {negs:,} neg  ({hard:,} hard = {hard/negs:.0%}, {easy:,} easy)")
+    if args.arm == "a2" and hard / negs < 0.5:
+        print(f"  !! a2 is {hard/negs:.0%} hard negatives. Expected ~78%. "
+              f"a1 and a2 may be near-identical -- check pipeline.task output "
+              f"before spending hours here.")
+    if args.limit:
+        print(f"  (this run  : {sum(1 for r in rows if r['neg_type']=='hard')}"
+              f" hard / {sum(1 for r in rows if r['neg_type']=='easy')} easy)")
 
     proc, model = load_model(args.model, train=True, attn=args.attn)
     if args.grad_ckpt:
