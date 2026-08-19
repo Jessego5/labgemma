@@ -211,29 +211,45 @@ def cmd_fit(args) -> int:
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True,
                     collate_fn=lambda b: collate(b, pad_id), num_workers=2)
 
-    steps = (len(dl) // args.accum) * args.epochs
+    # ceil, not floor: with 8 smoke-test rows and accum 16, floor gives 0
+    # steps and the scheduler is built for a run that never happens.
+    import math
+    steps_per_epoch = max(1, math.ceil(len(dl) / args.accum))
+    steps = steps_per_epoch * args.epochs
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                             lr=args.lr)
     sched = get_linear_schedule_with_warmup(opt, int(0.03 * steps), steps)
 
+    trainable = [p for p in model.parameters() if p.requires_grad]
+
+    def optimizer_step():
+        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+        opt.step(); sched.step(); opt.zero_grad()
+
     model.train()
     step = 0
     for ep in range(args.epochs):
-        run = 0.0
+        run, i = 0.0, 0
         for i, batch in enumerate(dl, 1):
             batch = {k: v.to(model.device) for k, v in batch.items()}
             loss = model(**batch).loss / args.accum
             loss.backward()
             run += loss.item() * args.accum
             if i % args.accum == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad], 1.0)
-                opt.step(); sched.step(); opt.zero_grad()
+                optimizer_step()
                 step += 1
                 if step % 20 == 0:
                     print(f"  ep{ep+1} step {step}/{steps} "
                           f"loss {run/i:.4f}", flush=True)
-        print(f"epoch {ep+1} mean loss {run/max(len(dl),1):.4f}")
+        # Flush the tail. Without this the last partial accumulation window is
+        # silently discarded -- and on a short run (a smoke test, or any epoch
+        # whose row count is not a multiple of accum) that can mean NO
+        # optimizer step ever executes.
+        if i % args.accum != 0:
+            optimizer_step()
+            step += 1
+        print(f"epoch {ep+1} mean loss {run/max(len(dl),1):.4f} "
+              f"({step} optimizer steps so far)")
 
     out = args.out or str(config.DATA_ROOT / "runs" / args.arm)
     os.makedirs(out, exist_ok=True)
