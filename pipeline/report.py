@@ -54,11 +54,15 @@ def analyse(preds, thr):
     return out
 
 
+CELL = 27
+
+
 def fmt(m):
+    """One cell. Fixed width so columns cannot collide when n grows."""
     if not m:
-        return "     --"
-    return (f"{m['auroc']:.3f}  {m['accuracy']:.3f}  {m['f1']:.3f}"
-            f"  n={m['n']:,}")
+        return "--".ljust(CELL)
+    return (f"{m['auroc']:.3f} {m['accuracy']:.3f} {m['f1']:.3f} "
+            f"{m['n']:>6,}").ljust(CELL)
 
 
 def main(argv=None) -> int:
@@ -77,15 +81,12 @@ def main(argv=None) -> int:
     keys = ["overall", "easy", "hard", "compound", "single"]
     width = max(len(k) for k in runs) + 2
 
-    print(f"{'':<{width}}" + "".join(f"{k:<26}" for k in keys))
-    print(f"{'':<{width}}" + "".join(f"{'AUROC   acc     F1':<26}" for _ in keys))
-    print("-" * (width + 26 * len(keys)))
+    print(f"{'':<{width}}" + "".join(k.ljust(CELL) for k in keys))
+    print(f"{'':<{width}}" + "".join(
+        "AUROC   acc    F1      n".ljust(CELL) for _ in keys))
+    print("-" * (width + CELL * len(keys)))
     for name, res in runs.items():
-        line = f"{name:<{width}}"
-        for k in keys:
-            m = res.get(k)
-            line += f"{fmt(m).replace('  n=', ' n='):<26}" if m else f"{'--':<26}"
-        print(line)
+        print(f"{name:<{width}}" + "".join(fmt(res.get(k)) for k in keys))
 
     # The two comparisons the project exists to make.
     print("\nkey deltas:")
