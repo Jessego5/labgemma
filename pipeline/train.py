@@ -267,6 +267,9 @@ def cmd_fit(args) -> int:
               f" hard / {sum(1 for r in rows if r['neg_type']=='easy')} easy)")
 
     proc, model = load_model(args.model, train=True, attn=args.attn)
+    ids = yes_no_ids(proc)
+    val_rows = load_rows(task / "validation.csv")[:args.val_rows] \
+        if args.val_rows else []
     if args.grad_ckpt:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
@@ -299,6 +302,9 @@ def cmd_fit(args) -> int:
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step(); sched.step(); opt.zero_grad()
 
+    if val_rows:
+        eval_snapshot(model, proc, val_rows, ids, args.max_len, "before")
+
     model.train()
     step = 0
     for ep in range(args.epochs):
@@ -326,6 +332,9 @@ def cmd_fit(args) -> int:
         if ds.bad:
             print(f"  !! {ds.bad} row(s) lost their answer to truncation -- "
                   f"raise --max-len")
+        if val_rows:
+            eval_snapshot(model, proc, val_rows, ids, args.max_len,
+                          f"epoch {ep+1}")
 
     out = args.out or str(config.DATA_ROOT / "runs" / args.arm)
     os.makedirs(out, exist_ok=True)
@@ -355,17 +364,32 @@ def cmd_score(args) -> int:
     ids = yes_no_ids(proc)
     print(f"yes ids {ids['yes']}  no ids {ids['no']}")
 
+    preds = score_rows(model, proc, rows, ids, args.max_len, verbose=True)
+
+    out = args.out or str(config.DATA_ROOT / "preds.json")
+    with open(out, "w") as f:
+        json.dump(preds, f)
+    print(f"\nwrote {out}")
+    print(f"score it with: python -m pipeline.report {out}")
+    return 0
+
+
+def score_rows(model, proc, rows, ids, max_len, verbose=False):
+    """Score rows into prediction dicts. Shared by `score` and in-fit eval."""
+    import torch
+
+    was_training = model.training
+    model.eval()
     preds = []
     with torch.no_grad():
         for i, r in enumerate(rows, 1):
             # Same construction as training, so scoring cannot drift from fit.
-            enc = encode_prompt(proc, r["image_path"], r["question"],
-                                args.max_len)
+            enc = encode_prompt(proc, r["image_path"], r["question"], max_len)
             enc = {k: (v.unsqueeze(0) if hasattr(v, "dim") and v.dim() >= 1
                        else v) for k, v in enc.items()}
             enc = {k: (v.to(model.device) if hasattr(v, "to") else v)
                    for k, v in enc.items()}
-            logits = model(**enc).logits[0, -1]          # next-token logits
+            logits = model(**enc).logits[0, -1]
             probs = torch.softmax(logits.float(), dim=-1)
             py = float(probs[ids["yes"]].sum())
             pn = float(probs[ids["no"]].sum())
@@ -375,15 +399,32 @@ def cmd_score(args) -> int:
                 "pmcid": r["pmcid"], "figure_id": r["figure_id"],
                 "compound_figure": r.get("compound_figure", ""),
             })
-            if i % 200 == 0:
+            if verbose and i % 200 == 0:
                 print(f"  [{i:,}/{len(rows):,}]", flush=True)
+    if was_training:
+        model.train()
+    return preds
 
-    out = args.out or str(config.DATA_ROOT / "preds.json")
-    with open(out, "w") as f:
-        json.dump(preds, f)
-    print(f"\nwrote {out}")
-    print(f"score it with: python -m pipeline.report {out}")
-    return 0
+
+def eval_snapshot(model, proc, rows, ids, max_len, tag):
+    """
+    Validation AUROC on a subset, printed mid-run.
+
+    Worth the couple of minutes: zero-shot already scores 0.896 on hard
+    negatives, so there is only ~0.10 of headroom and LoRA can plausibly make
+    things WORSE. Without a mid-run signal that only surfaces after a full
+    two-hour fit plus a full scoring pass.
+    """
+    from .baselines import auroc
+
+    preds = score_rows(model, proc, rows, ids, max_len)
+    overall = auroc([(p["score"], p["label"]) for p in preds])
+    pos = [p for p in preds if p["label"] == 1]
+    hard = [p for p in preds if p["neg_type"] == "hard"]
+    h = auroc([(p["score"], p["label"]) for p in pos + hard]) if hard else float("nan")
+    print(f"  [{tag}] val AUROC overall {overall:.3f}  hard {h:.3f} "
+          f"(n={len(preds):,})", flush=True)
+    return overall
 
 
 def cmd_probe(args) -> int:
@@ -456,6 +497,9 @@ def main(argv=None) -> int:
     # a 24 GB card is the vision tower, not the language model.
     f.add_argument("--batch", type=int, default=1)
     f.add_argument("--accum", type=int, default=16)
+    f.add_argument("--val-rows", type=int, default=300,
+                   help="validation rows to score before and after each epoch "
+                        "(0 to disable)")
     f.add_argument("--grad-ckpt", action="store_true",
                    help="trade ~30%% speed for a large activation-memory cut")
     f.add_argument("--lr", type=float, default=1e-4)
