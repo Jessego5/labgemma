@@ -44,6 +44,28 @@ step () {          # step <name> <sentinel-path> <command...>
   printf '===  %-22s done %s\n' "$name" "$(date '+%H:%M:%S')"
 }
 
+# --- preflight -------------------------------------------------------------
+# Each of these has cost a run: a fresh pod wipes pip packages, tmux sessions
+# created before an export do not see it, and the Gemma repo is gated. Failing
+# here costs seconds; failing three minutes into fit_a1 costs the night.
+fail=0
+python -c 'import torch, transformers, peft' 2>/dev/null || {
+  echo "!! missing packages. pip install transformers peft accelerate"; fail=1; }
+python -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' 2>/dev/null || {
+  echo "!! no CUDA device visible"; fail=1; }
+if [ -z "${HF_TOKEN:-}" ] && [ ! -f "${HF_HOME:-$HOME/.cache/huggingface}/token" ]; then
+  echo "!! no Hugging Face credential. google/gemma-3-4b-it is a gated repo."
+  echo "   export HF_HOME=/workspace/hf_cache && huggingface-cli login --token hf_..."
+  fail=1
+fi
+for f in "$D/task/a1/train.csv" "$D/task/a2/train.csv" "$D/task/test.csv"; do
+  [ -f "$f" ] || { echo "!! missing $f -- run python -m pipeline.task"; fail=1; }
+done
+[ -d "$D/images_masked" ] || {
+  echo "!! no $D/images_masked -- run python -m pipeline.ocr mask --split test"; fail=1; }
+[ "$fail" -eq 0 ] || { echo; echo "preflight failed; nothing started."; exit 1; }
+echo "preflight OK"
+
 T0=$(date +%s)
 
 # 1. Baseline evals -- no training, and the masked one fills the biggest blank
